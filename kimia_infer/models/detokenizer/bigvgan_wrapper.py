@@ -101,7 +101,9 @@ class BigVGANWrapper:
             data = f.read()
         json_config = json.loads(data)
         h = AttrDict(json_config)
-        vocoder = BigVGAN(h, True)
+        # 修改点13：将vocoder的训练模式设置False
+        vocoder = BigVGAN(h, False)
+        # vocoder = BigVGAN(h, True)
         state_dict_g = load_checkpoint(ckpt_path, "cpu")
         vocoder.load_state_dict(state_dict_g["generator"])
 

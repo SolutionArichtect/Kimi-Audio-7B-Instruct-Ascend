@@ -2,14 +2,15 @@ import os
 
 import tqdm
 import torch
+import torch_npu
 from loguru import logger
 from huggingface_hub import cached_assets_path
 from transformers import AutoModelForCausalLM
+from huggingface_hub import snapshot_download
 
 from kimia_infer.models.detokenizer import get_audio_detokenizer
 from .prompt_manager import KimiAPromptManager
 from kimia_infer.utils.sampler import KimiASampler
-from huggingface_hub import snapshot_download
 
 class KimiAudio(object):
     def __init__(self, model_path: str, load_detokenizer: bool = True):
@@ -24,16 +25,20 @@ class KimiAudio(object):
     
         logger.info(f"Looking for resources in {cache_path}")
         logger.info(f"Loading whisper model")
+        #修改点4：添加local_files_only=True
         self.alm = AutoModelForCausalLM.from_pretrained(
-            cache_path, torch_dtype=torch.bfloat16, trust_remote_code=True
+            cache_path, torch_dtype=torch.bfloat16, trust_remote_code=True, local_files_only=True
         )
-        self.alm = self.alm.to(torch.cuda.current_device())
+        # 修改点16
+        self.alm = self.alm.to(torch.npu.current_device())
+        # self.alm = self.alm.to(torch.cuda.current_device())
 
         model_config = self.alm.config
+        self.kimia_text_audiodelaytokens = model_config.kimia_mimo_audiodelaytokens
         self.kimia_token_offset = model_config.kimia_token_offset
 
         self.prompt_manager = KimiAPromptManager(
-            model_path=cache_path, kimia_token_offset=self.kimia_token_offset
+            model_path=cache_path, kimia_token_offset=self.kimia_token_offset, kimia_text_audiodelaytokens=self.kimia_text_audiodelaytokens
         )
 
         if load_detokenizer:
@@ -45,7 +50,6 @@ class KimiAudio(object):
             self.detokenizer = None
 
         self.extra_tokens = self.prompt_manager.extra_tokens
-        self.kimia_text_audiodelaytokens = 6
         self.eod_ids = [self.extra_tokens.msg_end, self.extra_tokens.media_end]
 
     @torch.inference_mode()
@@ -82,19 +86,19 @@ class KimiAudio(object):
         previous_audio_tokens = torch.zeros(
             (4096,),
             dtype=torch.int,
-            device=torch.cuda.current_device(),
+            device=torch.npu.current_device(),
         )
         text_previous_tokens = torch.zeros(
             (4096,),
             dtype=torch.int,
-            device=torch.cuda.current_device(),
+            device=torch.npu.current_device(),
         )
 
         decoder_input_audio_ids = audio_input_ids.clone()
         decoder_input_text_ids = text_input_ids.clone()
         decoder_position_ids = (
             torch.arange(
-                0, decoder_input_audio_ids.shape[1], device=torch.cuda.current_device()
+                0, decoder_input_audio_ids.shape[1], device=torch.npu.current_device()
             )
             .unsqueeze(0)
             .long()
@@ -107,6 +111,40 @@ class KimiAudio(object):
 
         valid_text_length = 0
         valid_audio_length = 0
+        #profile性能采集 
+        experimental_config = torch_npu.profiler._ExperimentalConfig(
+            export_type=[
+                torch_npu.profiler.ExportType.Text
+                ],
+            profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+            msprof_tx=False,    # 原参数名msprof_tx改为mstx，新版本依旧兼容原参数名msprof_tx
+            aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+            l2_cache=False,
+            op_attr=False,
+            data_simplification=False,
+            record_op_args=False,
+            gc_detect_threshold=None,
+            host_sys=[
+                torch_npu.profiler.HostSystem.CPU,
+                torch_npu.profiler.HostSystem.MEM],
+            sys_io=False,
+            sys_interconnection=False
+        )
+        # 添加Profiling采集基础配置参数，详细参数介绍可参考下文的参数说明
+        prof = torch_npu.profiler.profile(
+            activities=[
+                torch_npu.profiler.ProfilerActivity.CPU,
+                torch_npu.profiler.ProfilerActivity.NPU
+                ],
+            schedule=torch_npu.profiler.schedule(wait=0, warmup=0, active=1, repeat=1, skip_first=1),
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("./result/stack"),
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=True,
+            with_modules=False,
+            with_flops=False,
+            experimental_config=experimental_config)
+        #prof.start()  
 
         for i in tqdm.tqdm(
             range(max_new_tokens), desc="Generating tokens", disable=False
@@ -120,6 +158,7 @@ class KimiAudio(object):
                 past_key_values=past_key_values,
                 return_dict=False,
             )
+            #prof.step()
 
             # Sample text token using the sampler
             next_token_text = sampler.sample_text_logits(
@@ -133,7 +172,7 @@ class KimiAudio(object):
 
             if text_stream_is_finished:
                 next_token_text.fill_(self.extra_tokens.kimia_text_blank)
-            elif next_token_text.item() == self.extra_tokens.kimia_text_eos:
+            elif next_token_text == self.extra_tokens.kimia_text_eos:
                 text_stream_is_finished = True
             else:
                 valid_text_length += 1
@@ -150,7 +189,7 @@ class KimiAudio(object):
 
             previous_audio_tokens[i : i + 1] = next_audio_token
 
-            audio_stream_is_finished = next_audio_token.item() in self.eod_ids
+            audio_stream_is_finished = next_audio_token in self.eod_ids
 
             if (
                 output_type == "text"
@@ -181,7 +220,7 @@ class KimiAudio(object):
                 decoder_input_text_ids = next_token_text.unsqueeze(1)
 
                 decoder_position_ids = (
-                    torch.zeros(1, 1, device=torch.cuda.current_device())
+                    torch.zeros(1, 1, device=torch.npu.current_device())
                     .fill_(last_position_id + 1)
                     .long()
                     .view(1, 1)
@@ -190,6 +229,7 @@ class KimiAudio(object):
 
                 decoder_input_whisper_feature = None
                 decoder_is_continuous_mask = None
+        prof.stop() #结束性能采集
 
         return_text_tokens = (
             text_previous_tokens[:valid_text_length].detach().cpu().numpy().tolist()
@@ -229,7 +269,7 @@ class KimiAudio(object):
 
         history = self.prompt_manager.get_prompt(chats, output_type=output_type)
 
-        audio_input_ids, text_input_ids, is_continuous_mask = history.to_tensor()
+        audio_input_ids, text_input_ids, is_continuous_mask, _, _ = history.to_tensor()
         audio_features = history.continuous_feature
 
         generated_wav_tokens = []
@@ -241,10 +281,10 @@ class KimiAudio(object):
             if max_new_tokens == -1:
                 max_new_tokens = 7500 - audio_input_ids.shape[1]
 
-        audio_input_ids = audio_input_ids.to(torch.cuda.current_device())
-        text_input_ids = text_input_ids.to(torch.cuda.current_device())
-        is_continuous_mask = is_continuous_mask.to(torch.cuda.current_device())
-        audio_features = [f.to(torch.cuda.current_device()) for f in audio_features]
+        audio_input_ids = audio_input_ids.to(torch.npu.current_device())
+        text_input_ids = text_input_ids.to(torch.npu.current_device())
+        is_continuous_mask = is_continuous_mask.to(torch.npu.current_device())
+        audio_features = [f.to(torch.npu.current_device()) for f in audio_features]
 
         generated_wav_tokens, generated_text_tokens = self._generate_loop(
             audio_input_ids=audio_input_ids,
@@ -288,7 +328,7 @@ class KimiAudio(object):
         chunk_size = 30  # hard-coded right now
         first_chunk_size = 30
         cache_speech_collection = []
-        audio_tokens = audio_tokens.to(torch.cuda.current_device())
+        audio_tokens = audio_tokens.to(torch.npu.current_device())
         audio_tokens = audio_tokens.long()
         num_audio_tokens = audio_tokens.size(1)
         first_chunk_semantic_tokens = audio_tokens[:, :first_chunk_size]

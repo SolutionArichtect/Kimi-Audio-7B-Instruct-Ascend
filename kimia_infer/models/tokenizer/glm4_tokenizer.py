@@ -6,13 +6,14 @@ from transformers import WhisperFeatureExtractor
 from .glm4.speech_tokenizer.modeling_whisper import WhisperVQEncoder
 from .glm4.speech_tokenizer.utils import extract_speech_token
 from torch import nn
-
+from torch_npu.contrib import transfer_to_npu
 
 class Glm4Tokenizer(nn.Module):
     def __init__(self, tokenizer_path):
         super().__init__()
         self.whisper_model = WhisperVQEncoder.from_pretrained(tokenizer_path).eval()
-        self.feature_extractor = WhisperFeatureExtractor.from_pretrained(tokenizer_path)
+        #修改点5：添加local_files_only=True
+        self.feature_extractor = WhisperFeatureExtractor.from_pretrained(tokenizer_path, local_files_only=True)
 
     def tokenize(self, speech=None, audio_path=None, sr=16000):
         if audio_path:

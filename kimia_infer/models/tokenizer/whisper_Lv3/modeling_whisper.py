@@ -23,16 +23,18 @@ from typing import Optional, Tuple, Union
 
 import numpy as np
 import torch
+from torch_npu.contrib import transfer_to_npu
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import CrossEntropyLoss
 from torch.nn.utils.rnn import pad_sequence
-from flash_attn import (
-    flash_attn_qkvpacked_func,
-    flash_attn_func,
-    flash_attn_varlen_func,
-    flash_attn_varlen_qkvpacked_func,
-)
+# 修改点8 加入自动迁移工具和注释掉flash attention
+# from flash_attn import (
+#     flash_attn_qkvpacked_func,
+#     flash_attn_func,
+#     flash_attn_varlen_func,
+#     flash_attn_varlen_qkvpacked_func,
+# )
 
 try:
     is_fa3_ready = True
@@ -338,6 +340,8 @@ class WhisperAttention(nn.Module):
         seq_lens: Optinal, [bsz]
         """
         ### use flash_attn_func when seq_lens is None
+        import torch_npu
+        import math
 
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
@@ -345,78 +349,51 @@ class WhisperAttention(nn.Module):
         if cu_seqlens_q is None:
             bsz, tgt_len, _ = hidden_states.size()
             query_states = query_states.view(
-                bsz, tgt_len, self.num_heads, self.head_dim
+                bsz * tgt_len, self.num_heads, self.head_dim
             )
-            key_states = key_states.view(bsz, tgt_len, self.num_heads, self.head_dim)
+            key_states = key_states.view(bsz * tgt_len, self.num_heads, self.head_dim)
             value_states = value_states.view(
-                bsz, tgt_len, self.num_heads, self.head_dim
+                bsz * tgt_len, self.num_heads, self.head_dim
             )
 
-            if is_fa3_ready:
-                attn_output, attn_probs_ret = fa3_func(
-                    query_states,
-                    key_states,
-                    value_states,
-                    softmax_scale=self.scaling,
-                    causal=self.is_decoder,
-                )
-                if output_attentions:
-                    attn_probs = attn_probs_ret
-                else:
-                    attn_probs = None
-            else:
-                attn_output = flash_attn_func(
-                    query_states,
-                    key_states,
-                    value_states,
-                    dropout_p=self.dropout,
-                    softmax_scale=self.scaling,
-                    causal=self.is_decoder,
-                    return_attn_probs=output_attentions,
-                )
-                if output_attentions:
-                    attn_output, attn_probs = attn_output
-                else:
-                    attn_probs = None
+            actual_seq_qlen = [tgt_len] * bsz
+            actual_seq_kvlen = [tgt_len] * bsz
+
+            attn_output = torch_npu.npu_fusion_attention(
+                query_states,
+                key_states,
+                value_states,
+                self.num_heads,
+                input_layout="TND",
+                actual_seq_qlen=actual_seq_qlen,
+                actual_seq_kvlen=actual_seq_kvlen,
+                scale=self.scaling,
+                keep_prob=1 - self.dropout if self.training else 1.0,
+            )[0]
+            
+            attn_probs = None
             attn_output = attn_output.view(bsz, tgt_len, self.embed_dim)
         else:
             query_states = query_states.view(-1, self.num_heads, self.head_dim)
             key_states = key_states.view(-1, self.num_heads, self.head_dim)
             value_states = value_states.view(-1, self.num_heads, self.head_dim)
-            if is_fa3_ready:
-                attn_output, attn_probs_ret = fa3_varlen_func(
-                    q=query_states,
-                    k=key_states,
-                    v=value_states,
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_k=cu_seqlens_kv,
-                    max_seqlen_q=max_seqlen_q,
-                    max_seqlen_k=max_seqlen_kv,
-                    softmax_scale=self.scaling,
-                    causal=self.is_decoder,
-                )
-                if output_attentions:
-                    attn_probs = attn_probs_ret
-                else:
-                    attn_probs = None
-            else:
-                attn_output = flash_attn_varlen_func(
-                    q=query_states,
-                    k=key_states,
-                    v=value_states,
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_k=cu_seqlens_kv,
-                    max_seqlen_q=max_seqlen_q,
-                    max_seqlen_k=max_seqlen_kv,
-                    dropout_p=self.dropout,
-                    softmax_scale=self.scaling,
-                    causal=self.is_decoder,
-                    return_attn_probs=output_attentions,
-                )
-                if output_attentions:
-                    attn_output, attn_probs = attn_output
-                else:
-                    attn_probs = None
+            
+            q_lens = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).cpu().numpy().tolist()
+            kv_lens = (cu_seqlens_kv[1:] - cu_seqlens_kv[:-1]).cpu().numpy().tolist()
+
+            attn_output = torch_npu.npu_fusion_attention(
+                query_states,
+                key_states,
+                value_states,
+                self.num_heads,
+                input_layout="TND",
+                actual_seq_qlen=tuple(q_lens),
+                actual_seq_kvlen=tuple(kv_lens),
+                scale=self.scaling,
+                keep_prob=1 - self.dropout if self.training else 1.0,
+            )[0]
+            
+            attn_probs = None
             attn_output = attn_output.view(-1, self.embed_dim)
 
         ret = self.out_proj(attn_output)

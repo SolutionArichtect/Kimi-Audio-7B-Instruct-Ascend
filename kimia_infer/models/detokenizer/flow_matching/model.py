@@ -329,7 +329,9 @@ class DiTPrefix(nn.Module):
             for b in range(bsz):
                 cur_rope = rotary_pos_emb[b]
                 cur_position_ids = position_ids[b]
-                cur_rope[:] = self.rotary_pos_emb[cur_position_ids]
+                #修改点14：将rope_pos_emb从cpu移动到与position_ids相同的设备上
+                cur_rope[:] = self.rotary_pos_emb.cpu()[cur_position_ids.cpu()].to(cur_position_ids.device)
+                # cur_rope[:] = self.rotary_pos_emb[cur_position_ids]
         else:
             rotary_pos_emb = None
 

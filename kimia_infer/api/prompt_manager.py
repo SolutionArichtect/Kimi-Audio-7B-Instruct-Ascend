@@ -5,6 +5,7 @@ import librosa
 import torch
 from loguru import logger
 from transformers import AutoTokenizer
+from torch_npu.contrib import transfer_to_npu
 
 
 from kimia_infer.models.tokenizer.whisper_Lv3.whisper import WhisperEncoder
@@ -13,9 +14,9 @@ from kimia_infer.utils.data import KimiAContent
 from kimia_infer.utils.special_tokens import instantiate_extra_tokens
 
 class KimiAPromptManager:
-    def __init__(self, model_path: str, kimia_token_offset: int):
-        self.audio_tokenizer = Glm4Tokenizer("THUDM/glm-4-voice-tokenizer")
-        self.audio_tokenizer = self.audio_tokenizer.to(torch.cuda.current_device())
+    def __init__(self, model_path: str, kimia_token_offset: int, kimia_text_audiodelaytokens: int):
+        self.audio_tokenizer = Glm4Tokenizer("/workspace/model/glm-4-voice-tokenizer")
+        self.audio_tokenizer = self.audio_tokenizer.to(torch.npu.current_device())
 
         logger.info(f"Looking for resources in {model_path}")
         logger.info(f"Loading whisper model")
@@ -23,16 +24,24 @@ class KimiAPromptManager:
         self.whisper_model = WhisperEncoder(
             os.path.join(model_path, "whisper-large-v3"), mel_batch_size=20
         )
-        self.whisper_model = self.whisper_model.to(torch.cuda.current_device())
+        self.whisper_model = self.whisper_model.to(torch.npu.current_device())
         self.whisper_model = self.whisper_model.bfloat16()
         self.whisper_model.eval()
 
         logger.info(f"Loading text tokenizer")
-        self.text_tokenizer = AutoTokenizer.from_pretrained(
-            model_path, trust_remote_code=True
-        )
+        if os.path.exists(model_path) and os.path.exists(os.path.join(model_path, "tokenizer_config.json")):
+            self.text_tokenizer = AutoTokenizer.from_pretrained(
+                model_path, trust_remote_code=True, local_files_only=True
+            )
+        else:
+            logger.info(f"Can not find text tokenizer in {model_path}, Loading default text tokenizer from moonshotai/Kimi-Audio-7B-Instruct")
+            self.text_tokenizer = AutoTokenizer.from_pretrained(
+                "moonshotai/Kimi-Audio-7B-Instruct", trust_remote_code=True, local_files_only=True
+            )
 
         self.extra_tokens = instantiate_extra_tokens(self.text_tokenizer)
+
+        self.kimia_text_audiodelaytokens = kimia_text_audiodelaytokens
 
         self.kimia_token_offset = kimia_token_offset
 
@@ -45,7 +54,7 @@ class KimiAPromptManager:
     def _tokenize_audio(self, wav_path):
         wav_tokens = self.audio_tokenizer.tokenize(audio_path=wav_path)
         wav_tokens = wav_tokens + self.kimia_token_offset
-        wav_tokens_list = wav_tokens.squeeze(0).cpu().numpy().tolist()
+        wav_tokens_list = wav_tokens.squeeze(0).tolist()
         return wav_tokens_list
 
     def extract_whisper_feat(self, wav: torch.Tensor | str):
@@ -58,7 +67,7 @@ class KimiAPromptManager:
         else:
             raise ValueError(f"Invalid wav type: {type(wav)}")
         assert self.whisper_model is not None
-        wav_tensor = wav_tensor.to(torch.cuda.current_device())
+        wav_tensor = wav_tensor.to(torch.npu.current_device())
         continous_feature = self.whisper_model.tokenize_waveform(wav_tensor)
         continous_feature = continous_feature.reshape(
             continous_feature.shape[0],
@@ -80,6 +89,8 @@ class KimiAPromptManager:
 
         role = message["role"]
 
+        has_loss = role == "assistant"
+
         if tokenize_role:
             if role == "user":
                 kimia_content_msg.audio_append(self.extra_tokens.kimia_user_msg_start)
@@ -96,18 +107,25 @@ class KimiAPromptManager:
             text = message["content"]
             text_tokens = self._tokenize_text(text)
 
-            kimia_content_msg.text_extend(text_tokens)
+            kimia_content_msg.text_extend(text_tokens, has_loss)
             kimia_content_msg.audio_extend(
                 [self.extra_tokens.kimia_text_blank] * len(text_tokens)
             )
 
+            if role == "assistant":
+                kimia_content_msg.text_append(self.extra_tokens.kimia_text_eos, has_loss) # eos for text stream
+                kimia_content_msg.audio_append(self.extra_tokens.kimia_text_blank, audio_token_loss_mask=False)
+
         elif message["message_type"] == "audio":
-            audio_path = message["content"]
-            speech_tokens = self._tokenize_audio(audio_path)
+            if "audio_tokens" in message:
+                speech_tokens = message["audio_tokens"]
+            else:
+                audio_path = message["content"]
+                speech_tokens = self._tokenize_audio(audio_path)
 
             kimia_content_msg.audio_append(self.extra_tokens.media_begin)
-            kimia_content_msg.audio_extend(speech_tokens, is_continuous=True)
-            kimia_content_msg.audio_append(self.extra_tokens.media_end)
+            kimia_content_msg.audio_extend(speech_tokens, is_continuous=True, audio_token_loss_mask=has_loss)
+            kimia_content_msg.audio_append(self.extra_tokens.media_end, audio_token_loss_mask=has_loss) # EOS for audio stream
             kimia_content_msg.text_extend(
                 [self.extra_tokens.kimia_text_blank] * (len(speech_tokens) + 2)
             )
@@ -124,13 +142,24 @@ class KimiAPromptManager:
             if extract_whisper_feature:
                 whisper_feature = self.extract_whisper_feat(audio_path)
                 kimia_content_msg.continuous_feature.append(whisper_feature)
+        elif message["message_type"] == "audio-text":
+            audio_path, text = message["content"]
+            speech_tokens = self._tokenize_audio(audio_path)
+            text_tokens = self._tokenize_text(text)
+
+            kimia_content_msg.audio_extend([self.extra_tokens.kimia_text_blank] * self.kimia_text_audiodelaytokens)
+            kimia_content_msg.audio_extend(speech_tokens, is_continuous=False)
+            kimia_content_msg.text_extend(text_tokens)
+            text_pad_tokens = (self.kimia_text_audiodelaytokens + len(speech_tokens) - len(text_tokens)) * [self.extra_tokens.kimia_text_blank]
+            kimia_content_msg.text_extend(text_pad_tokens)
+
         elif message["message_type"] == None:
             pass
         else:
             raise NotImplementedError(f"message_type: {message['message_type']}")
 
         if has_msg_end_token:
-            kimia_content_msg.audio_append(self.extra_tokens.msg_end)
+            kimia_content_msg.audio_append(self.extra_tokens.msg_end, audio_token_loss_mask=False)
             kimia_content_msg.text_append(self.extra_tokens.kimia_text_blank)
 
         assert (
@@ -140,7 +169,7 @@ class KimiAPromptManager:
         return kimia_content_msg
 
     def get_prompt(
-        self, messages: List[Dict], output_type: str = "text"
+        self, messages: List[Dict], output_type: str = "text", add_assistant_start_msg: bool = True
     ) -> KimiAContent:
         """
         messages: List[Dict]
@@ -191,17 +220,18 @@ class KimiAPromptManager:
             )
             msgs.append(msg)
 
-        assistant_start_msg = self.tokenize_message(
-            message={
-                "role": "assistant",
-                "message_type": None,
-            },
-            tokenize_role=True,
-            has_ct_token=False,
-            has_msg_end_token=False,
-        )
+        if add_assistant_start_msg:
+            assistant_start_msg = self.tokenize_message(
+                    message={
+                        "role": "assistant",
+                    "message_type": None,
+                },
+                tokenize_role=True,
+                has_ct_token=False,
+                has_msg_end_token=False,
+            )
 
-        msgs.append(assistant_start_msg)
+            msgs.append(assistant_start_msg)
 
         ret_msg = msgs[0]
 

@@ -2,6 +2,7 @@
 #   LICENSE is in incl_licenses directory.
 
 import torch
+from torch_npu.contrib import transfer_to_npu
 import torch.nn as nn
 import torch.nn.functional as F
 import math
@@ -93,9 +94,10 @@ class LowPassFilter1d(nn.Module):
     # Input [B, C, T]
     def forward(self, x):
         _, C, _ = x.shape
-
-        if self.padding:
-            x = F.pad(x, (self.pad_left, self.pad_right), mode=self.padding_mode)
+        #修改点12：把x数据转换为float，计算完转回bf116
+        x = F.pad(x.float(), (self.pad_left, self.pad_right), mode="replicate").to(x.dtype)
+        # if self.padding:
+        #     x = F.pad(x, (self.pad_left, self.pad_right), mode=self.padding_mode)
         out = F.conv1d(x, self.filter.expand(C, -1, -1), stride=self.stride, groups=C)
 
         return out

@@ -5,8 +5,11 @@ import torch.nn as nn
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from flash_attn import flash_attn_varlen_func, flash_attn_varlen_qkvpacked_func
+#修改点6：注释掉导入fa算子，导入以下两个包
+from torch_npu.contrib import transfer_to_npu
+import torch_npu
+import math
+#from flash_attn import flash_attn_varlen_func, flash_attn_varlen_qkvpacked_func
 
 
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
@@ -115,17 +118,27 @@ class Attention(nn.Module):
                 q = q.view(B * N, self.num_heads, self.head_dim)
                 k = k.view(-1, self.num_heads, self.head_dim)
                 v = v.view(-1, self.num_heads, self.head_dim)
-
-                x = flash_attn_varlen_func(
-                    q=q,
-                    k=k,
-                    v=v,
-                    cu_seqlens_q=cu_seqlens,
-                    cu_seqlens_k=cu_seqlens_k,
-                    max_seqlen_q=max_seqlen,
-                    max_seqlen_k=max_seqlen_k,
-                    dropout_p=self.attn_drop.p if self.training else 0.0,
-                )
+                #修改点7：输出重构：https://www.hiascend.com/document/detail/zh/Pytorch/720/ptmoddevg/trainingmigrguide/performance_tuning_0034.html
+                head_num = q.shape[1]
+                x = torch_npu.npu_fusion_attention(
+                    q, k, v, head_num,
+                    pse=None,             
+                    atten_mask=None,
+                    scale=1.0 / math.sqrt(q.shape[-1]),
+                    keep_prob=1,
+                    input_layout="TND",
+                    actual_seq_qlen=tuple(cu_seqlens[1:].cpu().numpy().tolist()),
+                    actual_seq_kvlen=tuple(cu_seqlens_k[1:].cpu().numpy().tolist()))[0]
+                # x = flash_attn_varlen_func(
+                #     q=q,
+                #     k=k,
+                #     v=v,
+                #     cu_seqlens_q=cu_seqlens,
+                #     cu_seqlens_k=cu_seqlens_k,
+                #     max_seqlen_q=max_seqlen,
+                #     max_seqlen_k=max_seqlen_k,
+                #     dropout_p=self.attn_drop.p if self.training else 0.0,
+                # )
             else:
 
                 if incremental_state is not None:

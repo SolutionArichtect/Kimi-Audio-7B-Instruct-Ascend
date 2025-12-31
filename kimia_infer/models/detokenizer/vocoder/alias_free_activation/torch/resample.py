@@ -28,8 +28,8 @@ class UpSample1d(nn.Module):
     # x: [B, C, T]
     def forward(self, x):
         _, C, _ = x.shape
-
-        x = F.pad(x, (self.pad, self.pad), mode="replicate")
+        #修改点11：把x数据转换为float，计算完转回bf116
+        x = F.pad(x.float(), (self.pad, self.pad), mode="replicate").to(x.dtype)
         x = self.ratio * F.conv_transpose1d(
             x, self.filter.expand(C, -1, -1), stride=self.stride, groups=C
         )
