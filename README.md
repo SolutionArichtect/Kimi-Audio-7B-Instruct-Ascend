@@ -12,6 +12,9 @@ modelscope download --model moonshotai/Kimi-Audio-7B-Instruct --local_dir ./{你
 modelscope download --model ZhipuAI/glm-4-voice-tokenizer --local_dir ./{你的模型目录}
 ```
 
+请注意:
+请用./modeling_moonshot_kimia.py 替代权重文件中的modeling_moonshot_kimia
+
 请同步修改以下文件中的模型路径：
 - `cog-Kimi-Audio-7B-Instruct-main/kimia_infer/api/prompt_manager.py`
 - `cog-Kimi-Audio-7B-Instruct-main/infer.py`
