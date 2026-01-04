@@ -17,6 +17,8 @@ modelscope download --model ZhipuAI/glm-4-voice-tokenizer --local_dir ./{你的�
 - `cog-Kimi-Audio-7B-Instruct-main/infer.py`
 
 ## 快速开始
+git clone https://github.com/SolutionArichtect/Kimi-Audio-7B-Instruct-Ascend.git
+后续挂载该项目目录
 
 ### 1. 使用容器镜像
 
