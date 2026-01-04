@@ -145,7 +145,6 @@ class KimiAudio(object):
             with_flops=False,
             experimental_config=experimental_config)
         #prof.start()  
-
         for i in tqdm.tqdm(
             range(max_new_tokens), desc="Generating tokens", disable=False
         ):
