@@ -1,6 +1,7 @@
 # Kimi-Audio (Ascend NPU Version)
 
 该项目基于 [MoonshotAI/Kimi-Audio](https://github.com/MoonshotAI/Kimi-Audio) 进行修改，适配华为昇腾 NPU 环境。
+已支持多轮对话，参考infer1.py
 
 ## 模型准备
 
@@ -13,7 +14,9 @@ modelscope download --model ZhipuAI/glm-4-voice-tokenizer --local_dir ./{你的�
 ```
 
 请注意:
+```
 请用./modeling_moonshot_kimia.py 替代权重文件中的modeling_moonshot_kimia
+```
 
 请同步修改以下文件中的模型路径：
 - `cog-Kimi-Audio-7B-Instruct-main/kimia_infer/api/prompt_manager.py`
