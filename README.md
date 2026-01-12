@@ -29,7 +29,7 @@ git clone https://github.com/SolutionArichtect/Kimi-Audio-7B-Instruct-Ascend.git
 ### 1. 使用容器镜像
 
 #### 1.1 使用成品镜像
-拉取镜像（详情请咨询作者）：
+拉取镜像（现已公开）：docker pull swr.cn-southwest-2.myhuaweicloud.com/tangpan/kimi_audio:v0
 ```bash
 docker pull {镜像名称}
 ```
